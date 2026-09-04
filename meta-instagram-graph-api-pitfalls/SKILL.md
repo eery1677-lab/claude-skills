@@ -33,6 +33,12 @@ Before spending more time on "did I copy the token correctly" theories: verify t
 
 Meta has blocked programmatic posting to personal Facebook profiles for years — this isn't a permission you can request, it's not offered by any API version. If the business only has a personal profile and no Page, Facebook auto-posting is **flatly impossible** until a real Facebook Business Page is created first. Don't burn time hunting for a personal-profile posting permission; it doesn't exist.
 
+## 3b. Hashtag search (`ig_hashtag_search`) is also Facebook-Page-only — it does not exist on `graph.instagram.com`
+
+If you're on flow (b) (Instagram Login, no Facebook Page — see section 1) hoping to use hashtag search to discover trending content or competitor posts without needing a Facebook Page: it doesn't work. `GET https://graph.instagram.com/v21.0/ig_hashtag_search?...` returns `"Object with ID 'ig_hashtag_search' does not exist"` — the object itself isn't exposed on that host, full stop, not a permissions issue. Retrying against `graph.facebook.com` with the same flow-(b) token just produces the same "Cannot parse access token" error from section 2, because that token was never valid on that host to begin with.
+
+**Bottom line**: hashtag search, like publishing, is gated behind having a real Facebook Page linked to the account (flow (a)). There is no page-free path to it. If external/competitor content discovery matters for a flow-(b) account, the only real options are creating a Facebook Page (unlocking flow (a) and this endpoint), or falling back to manually-curated competitor account tracking instead of API-driven discovery.
+
 ## 4. `graph.instagram.com`'s `/me` field names: `user_id` vs `id`
 
 When calling `/me?fields=user_id,username,...` on the Instagram-Login flow, the field you need for all subsequent `/{id}/media` calls is **`user_id`** (the real Instagram-scoped account ID) — not the bare `id` field, which is a different, app-scoped identifier. Mixing them up doesn't error immediately; it just makes every subsequent media/insights call fail or return nothing, which reads as a permissions problem rather than an ID mix-up.
