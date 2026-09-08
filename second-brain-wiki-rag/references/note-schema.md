@@ -87,6 +87,8 @@ client = OpenAI(base_url="http://localhost:1234/v1", api_key="lm-studio")
 
 Notice the `⚠️ Contradictions & updates` section is doing real work here — it's not restating the main content, it's recording a specific thing that turned out to be wrong in practice and why the corrected guidance should be trusted over a naive first attempt.
 
+**⚠️ Parser warning, confirmed as a real production bug**: notice this example's own `## 📖 Structured knowledge` section contains `### 1. GUI and CLI setup` and `### 2. OpenAI-compatible local API` as internal subheadings — this is normal and expected for any note with more than a couple paragraphs of real content. When writing the code that extracts this section's body (for retrieval — see `graph-rag-algorithm.md`), **do not find the section's end by looking for "the next heading-like line."** A regex like "capture until the next `##`" will stop at that note's own `### 1.` subheading (a bare `##\s` pattern matches inside `### ` too, so this breaks on `###` subheadings as well as `##` ones) and silently truncate everything after it — in a real production instance this reduced a 2,000+ character note down to 30 characters, with no error anywhere. Find the end of `📖 Structured knowledge` by matching specifically for the *next section's own fixed marker* — `## ⚠️` or `## 🔗` — never a generic "any heading" pattern, since the whole point of this section is that it's allowed to contain the source material's own heading structure.
+
 ## Folder placement
 
 - `10_Wiki/Topics/` — conceptual/explanatory notes (how something works, a technique, a domain fact)

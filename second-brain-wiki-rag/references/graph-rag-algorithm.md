@@ -34,11 +34,17 @@ Two edge types, both undirected:
 
 ## Emit — budget-limited, labeled
 
-Walk the ranked list, appending each note's title + one-line insight (not the full body — keep entries short) to the output block until adding the next one would exceed `budget_chars`. Label each line:
+Walk the ranked list, appending each note's title + a content excerpt to the output block until adding the next one would exceed `budget_chars`. Label each line:
 - `🎯` if it was a seed (direct keyword match)
 - `🔗` if it arrived via graph expansion, and name which seed pulled it in — e.g. "connected via `LM Studio Deployment`"
 
 That labeling isn't optional polish: it's what lets the model (and a user reading the prompt) tell "this is directly relevant" apart from "this got pulled in because it's linked to something relevant" — useful signal for how much weight to give each item.
+
+**What excerpt to show — seeds need more than the one-line insight.** A graph-neighbor (🔗) surfacing just the title + one-line insight is fine — it's context, not the main answer. But a seed (🎯, a direct match) is often the note the query is actually *about*, and a one-line insight can't answer a specific question ("what's the price of X") the way the note's own structured-knowledge body can. Give seeds a real excerpt of the body (a few hundred characters), not just the insight line.
+
+**Don't take that excerpt as a blind prefix — center it on where the query's keywords actually appear.** `body[:400]` (or any fixed prefix length) silently fails whenever the specific thing being searched for isn't in the note's opening paragraph — which is often, since notes commonly open with general/introductory content (a company description, a category overview) before the specific details (a price table, a spec list) further down. Instead: find where the query's keywords occur in the body and take a window centered there, falling back to the plain prefix only if none of the keywords appear in the body at all.
+
+**When multiple keywords match at different positions, prefer the *furthest* one, not the nearest.** This is the counter-intuitive part, confirmed against a real failure: a generic keyword (a brand name, a category term) tends to appear almost immediately in a note — frequently because it's literally in the title or the opening sentence — while the specific thing someone is actually looking for (a model number, an exact figure) tends to sit deeper in the structured content. Centering the window on the *earliest* keyword match keeps re-selecting that same generic opening paragraph and misses the specific detail every time; taking the position of whichever matched keyword occurs *latest* in the body reliably lands closer to the specific content instead.
 
 ## Budget guidance
 
