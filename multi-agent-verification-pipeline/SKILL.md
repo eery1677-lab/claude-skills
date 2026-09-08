@@ -1,0 +1,71 @@
+---
+name: multi-agent-verification-pipeline
+description: How to design a multi-stage/multi-agent LLM pipeline where later stages review, critique, or retry earlier stages' output — especially with local/small models (LM Studio, Ollama). Use this whenever building or reviewing a pipeline with more than one LLM stage where one stage checks another's work (a "supervisor", "critic", "judge", or "committee" pattern), whenever a user asks for the agent to "self-verify", "learn from mistakes", or do "reinforcement learning" without a training pipeline, whenever deciding whether pipeline stages should run in parallel or in sequence, whenever choosing which model size to assign to which stage, or whenever integrating a third-party financial/trading/brokerage API that has real-money side effects. These are concrete decisions validated in a production multi-agent stock-analysis pipeline, not theoretical advice.
+---
+
+# Multi-Agent Verification Pipeline Design
+
+## Why this exists
+
+Once a pipeline has more than one LLM call reviewing or building on another's output, a handful of design mistakes recur regardless of domain: reviewers that can't actually catch errors, "reinforcement learning" that gets over- or under-scoped, unnecessary sequential bottlenecks, model sizes assigned by habit instead of by where they matter, and fallback branches that quietly never fire. Each of these was found and fixed in a real production pipeline (an 8-agent stock-analysis system: 4 analysts → bull/bear debate → research manager → risk officer), not invented in the abstract.
+
+## 1. A reviewer must never be the same model instance reviewing its own output
+
+If stage N's output is checked by calling the *same model* that produced it and asking "is this good?", the check is much weaker than it looks — a model's blind spots in generation are usually also its blind spots in self-review. This is not folklore: "The Self-Correction Illusion: LLMs Correct Others but Not Themselves" (arXiv:2606.05976) found this directly.
+
+**Fix**: the reviewer must be an independently-invoked model call, ideally a different (larger) model than the one being reviewed. If budget only allows one model size, still make the review a *separate call with a narrower, different system prompt* (never literally "critique your own last message") — but a genuinely different model is meaningfully stronger.
+
+## 2. Vague review criteria ("is this good?") produce inconsistent verdicts — use a fixed checklist
+
+A reviewer prompted with an open-ended "check if this is correct" gives different verdicts on near-identical inputs depending on incidental phrasing. This is the same failure mode Chain-of-Verification (Dhuliawala et al., 2023) addresses: plan concrete verification questions first, then judge based on the answers.
+
+**Fix**: give the reviewer a small fixed list of yes/no questions to answer explicitly before rendering a verdict — e.g. "(1) is every number grounded in the provided source data, not invented? (2) does the output stay inside this stage's own role, or drift into another stage's job? (3) is the conclusion concrete/actionable rather than vague? (4) does it contradict the source data?" A verdict derived from named checks is far more consistent run-to-run than an unstructured "looks fine to me."
+
+## 3. When a user asks for "reinforcement learning" without a training pipeline, they usually mean Reflexion, not weight updates
+
+If the system only has inference access to a local/hosted model (no fine-tuning pipeline), literal RL is off the table. But "make the agent learn from its mistakes and get better over time" has a real, well-established inference-time answer: Reflexion (Shinn et al., NeurIPS 2023, arXiv:2303.11366) — store verbal feedback from failures in a persistent buffer, and prepend a summary of it to the same role's future attempts. No weights change; the prompt does.
+
+**Fix**: when a review step (see #1-2) judges a stage's output as inadequate, don't just discard the verdict — persist a short (praise/penalty, one-line reason) record keyed by *role*, not by episode, since most pipelines see a different task each run (a different stock, a different customer, a different document) rather than literally repeating the same task. Inject a short "your recent track record: N praised / M penalized, most recent penalty reasons: [...]" block at the start of that role's system prompt on every future run. This is genuinely cheap (one JSON file, one string concatenation) and materially changes behavior — confirmed in production by fewer repeat mistakes on the flagged failure pattern across subsequent runs.
+
+## 4. Sequential execution is not automatically "more accurate" — schedule by actual data dependency
+
+The intuitive instinct once review/retry loops exist is "run everything one at a time so nothing gets confused" — but this conflates *accuracy* (does each stage's own verification catch its own errors) with *scheduling* (does stage B need to see stage A's finished output before B can start). These are independent questions. Two stages that don't read each other's output can run concurrently with zero accuracy cost, even if each has its own internal retry loop; the retry loop's correctness doesn't depend on what else is happening at the same wall-clock moment.
+
+**Fix**: draw the actual data-dependency graph (which stage's *input* requires which other stage's *output*) and parallelize every stage that has no dependency on another still-running stage, regardless of how many internal review/retry attempts each one might take. Reserve strict ordering for stages that are genuinely sequential (a debate stage needs both debaters' output; a final judge needs the debate). In the reference pipeline this cut wall-clock time by roughly a third with no verified quality change, by parallelizing the four independent analyst stages and serializing only the genuinely dependent debate → judge → final-review chain.
+
+## 5. Assign model size by (call frequency × how much a miss costs), not uniformly
+
+A pipeline with N review points doesn't need the same (largest, slowest) model at every one. A review call that fires once or twice per run (a final holistic check) can justify the biggest available model; a review call that fires on every one of 7-9 per-stage checks per run should use a lighter model — using the biggest model everywhere just multiplies latency for no proportionate accuracy gain, and users *notice* when something that used to answer standalone in seconds takes many times longer once it's embedded in a review pipeline.
+
+**Fix**: classify each review/generation point by (a) how often it's invoked per run and (b) how costly a miss at that point is (does it feed into the single final answer, or is it one voice among several that get cross-checked again downstream). Put the largest/slowest model only where both are high — rare *and* consequential. This was a direct fix in production after a user noticed a single-shot query to the large model was fast, but the same model invoked 7-9 times per pipeline run (once per stage's review) made the whole pipeline noticeably slower; moving the frequent per-stage reviews to a smaller model and keeping only the final holistic check on the large model recovered roughly 30% of the wall-clock time with no observed quality loss.
+
+## 6. A fallback branch gated on "is this data source configured" instead of "did this specific lookup return data" will silently never fire
+
+A common shape: `if (isSourceAConfigured()) { try sourceA; ... } else if (isSourceBConfigured()) { try sourceB; }`. This looks like "use A if available, otherwise B" but is actually "use A if configured, in which case never even attempt B" — if source A is configured but happens to return nothing for this specific input (e.g., a domestic financial-data API that has no record for a foreign company, even though the API key itself is valid and configured), the `else if` never runs, because the condition it's guarding is about *configuration*, not about *this call's actual outcome*. The result reads as "no data available" even though a working fallback source was sitting right there, unreached.
+
+**Fix**: when composing two data sources as primary+fallback, gate the fallback on the actual absence of the *result* (`!result`), not on the primary's configuration status. Structure it as two independent statements — fill from A if available, then a separate `if (!result && sourceBConfigured)` — rather than `if/else if` on the source's config flags. This class of bug is easy to miss because it produces a plausible-looking "no data" output rather than a crash, and only surfaces when someone traces through why a specific real input (not a synthetic test case) came back empty despite both sources supposedly being wired up.
+
+## 7. Before integrating a financial/trading API, fetch the real spec yourself and grep-verify against actual usage — don't trust a lossy web-fetch summary
+
+For anything that places, modifies, or cancels real orders, or reports real financial figures, guessing field names from general knowledge or from an AI-summarized fetch of the provider's docs page is not good enough — a summarization pass can silently truncate or omit the exact schema section needed, and a wrong field name on a write-side call (order placement/modification) is a much bigger risk than on a read-side call.
+
+**Fix**: download the raw OpenAPI/spec JSON directly (`curl` it to a file) and parse it with a real script (Python/`jq`) to extract the exact request/response schema for the specific endpoints in question — enum values, required vs optional fields, units. Cross-reference against the current codebase with `grep` to get a precise "used vs. unused" picture instead of trusting an agent's earlier summary of the same spec. For read-only endpoints where a script-based extraction isn't practical, a live `curl` against the real endpoint with a real credential, inspected by hand, is the equivalent verification — in production this caught a real-unit mismatch (a debt-to-equity field returned as a raw ratio needing `× 100`, not already a percentage like the neighboring margin fields) that would otherwise have silently displayed a wrong number to the end user.
+
+## 8. When you add a safety check to a shared resolution function, wire it into every call site — not just the one where the bug was reported
+
+A free-text-to-entity resolver that matches by "does the entity's canonical name appear as a substring of the user's text" has a structural blind spot: it can never match a canonical name that is *longer* than what the user typed (a user typing a common shorthand for a longer official name), while an unrelated entity whose name happens to be a substring of that same shorthand *will* match — silently returning the wrong entity with full confidence. This surfaced in production as a stock-ticker resolver: a user asking about "하이닉스" (a common shorthand for "SK하이닉스") was silently resolved to an unrelated smaller company "이닉스" whose name happens to be contained in the shorthand, because the official "SK하이닉스" name is longer than what the user typed and could never win the substring match.
+
+The fix itself — detect when a short resolved name is itself a substring of some other, longer, unrelated catalog entry, and refuse to proceed silently, asking the caller to disambiguate instead (mirroring how a careful assistant would ask a clarifying question rather than guess) — is the correct general principle for any pipeline resolving free-text references against a canonical entity set (ticker symbols, user lookups, product matching, document matching). But the fix is only as good as its coverage: this same resolver function had *five other call sites* beyond the one where the bug was first reported (a chat endpoint) — including a real-money order-placement endpoint and several internal pipeline tool calls — and the first patch covered only the reported one. The same bug class remained fully live in the other five until each was audited and wired to the same check.
+
+**Fix**: before considering a resolution-safety fix complete, `grep` every call site of the shared resolution function across the codebase, not just the one connected to the reported symptom. Rank the call sites by stakes (a path that can place a real order or move money outranks a path that only shapes an LLM's reading material) and verify the highest-stakes one with a real end-to-end test (a live API call, not just a type-check), even if the others are only spot-checked by pattern-matching against the already-verified fix.
+
+## What not to do
+
+- Don't let a model review its own literal output as "self-verification" — always use an independent call, ideally a bigger/different model.
+- Don't ask a reviewer an open-ended "is this correct?" — give it a fixed checklist of named questions to answer first.
+- Don't build literal fine-tuning/RL infrastructure when a user says "learn from mistakes" and there's no training pipeline — implement Reflexion-style persistent verbal feedback instead, and say so explicitly so expectations stay calibrated.
+- Don't default every pipeline stage to sequential execution just because retry/review loops exist — parallelize whatever the actual dependency graph allows.
+- Don't put the largest available model at every review point uniformly — reserve it for the review that fires rarest and matters most; use a lighter model for frequent per-stage checks.
+- Don't write a primary/fallback data source pair as `if (configured(A)) {...} else if (configured(B)) {...}` — gate the fallback on the primary's actual per-call result being empty, not on whether the primary is merely configured.
+- Don't integrate a financial/trading API from memory or a summarized doc fetch — pull the raw spec and grep/curl-verify the exact fields before writing code that touches money or reports numbers to a user.
+- Don't consider a resolution-safety fix (disambiguation, validation, a new guard) done once it's wired into the one call site connected to the reported bug — `grep` every call site of the shared resolution function and wire the same check into all of them, verifying the highest-stakes one end-to-end.
